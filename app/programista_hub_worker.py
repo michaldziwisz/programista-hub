@@ -170,7 +170,14 @@ def _maybe_update_provider_packs(conn, updater: ProviderPackUpdater) -> bool:
         if requested:
             _upsert_fetch_state(conn, "providers:update_requested", None)
         conn.commit()
-        return bool(result.updated)
+        updated = bool(result.updated)
+        if updated:
+            # If providers were updated, invalidate per-day schedule freshness markers so that
+            # schedules that previously failed (or were parsed differently) are refreshed quickly.
+            with conn.transaction():
+                conn.execute("DELETE FROM fetch_state WHERE key LIKE %s", ("providers:schedule:%",))
+            conn.commit()
+        return updated
     except Exception as e:  # noqa: BLE001
         log.warning("Providers update failed: %s", e)
         with conn.transaction():
@@ -373,19 +380,32 @@ def _ingest_schedule_for_source_day(
             )
             inserted += 1
 
-        _upsert_fetch_state(conn, f"providers:schedule:{kind}:{provider_id}:{source_id}:{day.isoformat()}", "1")
+        _upsert_fetch_state(
+            conn,
+            f"providers:schedule:{kind}:{provider_id}:{source_id}:{day.isoformat()}",
+            str(inserted),
+        )
 
     conn.commit()
     return inserted
 
 
 def _is_key_stale(conn, key: str, ttl_seconds: int) -> bool:
-    row = conn.execute("SELECT updated_at FROM fetch_state WHERE key=%s", (key,)).fetchone()
+    row = conn.execute("SELECT updated_at, value FROM fetch_state WHERE key=%s", (key,)).fetchone()
     if not row:
         return True
     updated_at: datetime = row["updated_at"]
+    value = row.get("value")
+    effective_ttl_seconds = ttl_seconds
+    if key.startswith("providers:schedule:") and isinstance(value, str):
+        try:
+            inserted = int(value.strip() or "0")
+        except ValueError:
+            inserted = 1
+        if inserted <= 0:
+            effective_ttl_seconds = min(ttl_seconds, 10 * 60)
     age = datetime.now(UTC) - updated_at
-    return age.total_seconds() >= ttl_seconds
+    return age.total_seconds() >= effective_ttl_seconds
 
 
 def _get_teleman_sources(conn) -> list[str]:
