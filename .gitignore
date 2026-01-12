@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+
+# Runtime/cache
+.cache/
+.providers/
+*.sqlite3
+
+# Local secrets/config
+.env
+.env.*
+secrets.env
+
+# Data dirs (server)
+pgdata/
+tmp/
+
