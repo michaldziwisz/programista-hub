@@ -93,6 +93,7 @@ _SCHEMA_STATEMENTS: list[str] = [
     )
     """.strip(),
     "CREATE INDEX IF NOT EXISTS schedule_item_lookup_idx ON schedule_item (provider_id, source_id, day, start_time)",
+    "CREATE INDEX IF NOT EXISTS schedule_item_details_ref_idx ON schedule_item (provider_id, details_ref) WHERE details_ref IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS provider_page_day_idx ON provider_page (provider_id, day)",
     """
     CREATE INDEX IF NOT EXISTS schedule_item_title_trgm_idx

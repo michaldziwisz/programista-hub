@@ -213,62 +213,191 @@ class SearchRequest(BaseModel):
     kinds: list[str] | None = None
     limit: int = Field(default=50, ge=1, le=200)
     cursor: int | None = Field(default=None, ge=1)
+    include_details: bool = Field(default=False)
 
 
 @app.post("/search")
 def search(req: SearchRequest) -> list[dict]:
-    q = req.query.strip()
+    raw_q = req.query.strip()
+    include_details = bool(req.include_details)
+
+    # Allow enabling details search without changing old clients: "opis: ..." etc.
+    q = raw_q
+    q_prefix = raw_q.casefold()
+    for prefix in ("opis:", "opisy:", "szczegoly:", "szczegóły:", "details:", "desc:"):
+        if q_prefix.startswith(prefix):
+            include_details = True
+            q = raw_q[len(prefix) :].strip()
+            break
+
     if not q:
         return []
 
-    sql = (
-        "SELECT "
-        "  si.id AS item_id, "
-        "  p.kind, "
-        "  si.provider_id, "
-        "  p.display_name AS provider_name, "
-        "  si.source_id, "
-        "  s.name AS source_name, "
-        "  si.day, "
-        "  si.start_time, "
-        "  si.title, "
-        "  si.subtitle, "
-        "  si.details_ref, "
-        "  si.details_summary, "
-        "  COALESCE(si.accessibility, '[]'::jsonb) AS accessibility "
-        "FROM schedule_item si "
-        "JOIN provider p ON p.id = si.provider_id "
-        "JOIN source s ON s.provider_id = si.provider_id AND s.id = si.source_id "
-        "LEFT JOIN item_details d ON d.provider_id = si.provider_id AND d.details_ref = si.details_ref "
-        "WHERE "
-        "  (programista_unaccent(lower(si.title)) LIKE programista_unaccent(lower(%s)) "
-        "   OR (si.subtitle IS NOT NULL AND programista_unaccent(lower(si.subtitle)) LIKE programista_unaccent(lower(%s))) "
-        "   OR (si.details_summary IS NOT NULL AND programista_unaccent(lower(si.details_summary)) LIKE programista_unaccent(lower(%s))) "
-        "   OR (d.details_text IS NOT NULL AND programista_unaccent(lower(d.details_text)) LIKE programista_unaccent(lower(%s))))"
-    )
+    def escape_like(s: str) -> str:
+        return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    pattern = f"%{q}%"
-    params: list[object] = [pattern, pattern, pattern, pattern]
+    pattern = f"%{escape_like(q)}%"
 
-    if req.kinds:
-        sql += " AND p.kind = ANY(%s)"
-        params.append(req.kinds)
-
-    # Cursor-based pagination: fetch older rows by id (newest first).
-    if req.cursor:
-        sql += " AND si.id < %s"
-        params.append(int(req.cursor))
-
-    # Deterministic ordering for paging.
-    sql += " ORDER BY si.id DESC"
-
-    sql += " LIMIT %s"
-    params.append(req.limit)
+    kinds = req.kinds or []
 
     with connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
+        # Use a bounded "recent scan" window to avoid pathological full-table scans
+        # for queries with 0 (or very few) matches.
+        max_id_row = conn.execute("SELECT max(id) AS max_id FROM schedule_item").fetchone()
+        max_id = int(max_id_row["max_id"]) if max_id_row and max_id_row.get("max_id") is not None else None
+        if max_id is None:
+            return []
 
-    return rows
+        effective_cursor = int(req.cursor) if req.cursor else max_id + 1
+
+        recent_window = int(os.environ.get("PROGRAMISTA_HUB_SEARCH_RECENT_WINDOW", "100000"))
+        if recent_window < 1000:
+            recent_window = 1000
+        recent_low = max(1, effective_cursor - recent_window)
+
+        sql_fast = (
+            "SELECT "
+            "  si.id AS item_id, "
+            "  p.kind, "
+            "  si.provider_id, "
+            "  p.display_name AS provider_name, "
+            "  si.source_id, "
+            "  s.name AS source_name, "
+            "  si.day, "
+            "  si.start_time, "
+            "  si.title, "
+            "  si.subtitle, "
+            "  si.details_ref, "
+            "  si.details_summary, "
+            "  COALESCE(si.accessibility, '[]'::jsonb) AS accessibility "
+            "FROM schedule_item si "
+            "JOIN provider p ON p.id = si.provider_id "
+            "JOIN source s ON s.provider_id = si.provider_id AND s.id = si.source_id "
+            "WHERE si.id < %s AND si.id >= %s "
+            "  AND (programista_unaccent(lower(si.title)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\' "
+            "       OR (si.subtitle IS NOT NULL AND programista_unaccent(lower(si.subtitle)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\') "
+            + (
+                "       OR (si.details_summary IS NOT NULL AND programista_unaccent(lower(si.details_summary)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\') "
+                "       OR (d.details_text IS NOT NULL AND programista_unaccent(lower(d.details_text)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\'))"
+                if include_details
+                else ")"
+            )
+        )
+        if include_details:
+            sql_fast = sql_fast.replace(
+                "WHERE si.id < %s AND si.id >= %s ",
+                "LEFT JOIN item_details d ON d.provider_id = si.provider_id AND d.details_ref = si.details_ref "
+                "WHERE si.id < %s AND si.id >= %s ",
+            )
+            params_fast: list[object] = [effective_cursor, recent_low, pattern, pattern, pattern, pattern]
+        else:
+            params_fast = [effective_cursor, recent_low, pattern, pattern]
+
+        if kinds:
+            sql_fast += " AND p.kind = ANY(%s)"
+            params_fast.append(kinds)
+
+        sql_fast += " ORDER BY si.id DESC LIMIT %s"
+        params_fast.append(req.limit)
+
+        rows_fast = conn.execute(sql_fast, params_fast).fetchall()
+        if len(rows_fast) >= req.limit or recent_low <= 1:
+            return rows_fast
+
+        remaining = int(req.limit) - len(rows_fast)
+
+        if not include_details:
+            # Slow path (older ids): trigram indexes on title/subtitle.
+            sql_slow = (
+                "SELECT "
+                "  si.id AS item_id, "
+                "  p.kind, "
+                "  si.provider_id, "
+                "  p.display_name AS provider_name, "
+                "  si.source_id, "
+                "  s.name AS source_name, "
+                "  si.day, "
+                "  si.start_time, "
+                "  si.title, "
+                "  si.subtitle, "
+                "  si.details_ref, "
+                "  si.details_summary, "
+                "  COALESCE(si.accessibility, '[]'::jsonb) AS accessibility "
+                "FROM schedule_item si "
+                "JOIN provider p ON p.id = si.provider_id "
+                "JOIN source s ON s.provider_id = si.provider_id AND s.id = si.source_id "
+                "WHERE si.id < %s "
+                "  AND (programista_unaccent(lower(si.title)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\' "
+                "       OR (si.subtitle IS NOT NULL AND programista_unaccent(lower(si.subtitle)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\'))"
+            )
+            params_slow: list[object] = [recent_low, pattern, pattern]
+            if kinds:
+                sql_slow += " AND p.kind = ANY(%s)"
+                params_slow.append(kinds)
+            sql_slow += " ORDER BY si.id DESC LIMIT %s"
+            params_slow.append(remaining)
+            rows_slow = conn.execute(sql_slow, params_slow).fetchall()
+            return list(rows_fast) + list(rows_slow)
+
+        # Slow path (older ids): use trigram indexes to avoid sequential scans.
+        sql_slow = (
+            "WITH ids AS ("
+            "  SELECT si.id "
+            "  FROM schedule_item si "
+            "  JOIN provider p ON p.id = si.provider_id "
+            "  WHERE si.id < %s "
+            "    AND (programista_unaccent(lower(si.title)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\' "
+            "         OR (si.subtitle IS NOT NULL AND programista_unaccent(lower(si.subtitle)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\') "
+            "         OR (si.details_summary IS NOT NULL AND programista_unaccent(lower(si.details_summary)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\'))"
+        )
+        params_slow = [recent_low, pattern, pattern, pattern]
+
+        if kinds:
+            sql_slow += " AND p.kind = ANY(%s)"
+            params_slow.append(kinds)
+
+        sql_slow += (
+            "  UNION "
+            "  SELECT si.id "
+            "  FROM item_details d "
+            "  JOIN schedule_item si ON si.provider_id = d.provider_id AND si.details_ref = d.details_ref "
+            "  JOIN provider p ON p.id = si.provider_id "
+            "  WHERE si.id < %s "
+            "    AND programista_unaccent(lower(d.details_text)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\'"
+        )
+        params_slow.extend([recent_low, pattern])
+
+        if kinds:
+            sql_slow += " AND p.kind = ANY(%s)"
+            params_slow.append(kinds)
+
+        sql_slow += (
+            ") "
+            "SELECT "
+            "  si.id AS item_id, "
+            "  p.kind, "
+            "  si.provider_id, "
+            "  p.display_name AS provider_name, "
+            "  si.source_id, "
+            "  s.name AS source_name, "
+            "  si.day, "
+            "  si.start_time, "
+            "  si.title, "
+            "  si.subtitle, "
+            "  si.details_ref, "
+            "  si.details_summary, "
+            "  COALESCE(si.accessibility, '[]'::jsonb) AS accessibility "
+            "FROM schedule_item si "
+            "JOIN ids ON ids.id = si.id "
+            "JOIN provider p ON p.id = si.provider_id "
+            "JOIN source s ON s.provider_id = si.provider_id AND s.id = si.source_id "
+            "ORDER BY si.id DESC "
+            "LIMIT %s"
+        )
+        params_slow.append(remaining)
+
+        rows_slow = conn.execute(sql_slow, params_slow).fetchall()
+        return list(rows_fast) + list(rows_slow)
 
 
 class DetailsRequest(BaseModel):
