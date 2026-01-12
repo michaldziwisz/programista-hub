@@ -261,3 +261,26 @@ def search(req: SearchRequest) -> list[dict]:
         rows = conn.execute(sql, params).fetchall()
 
     return rows
+
+
+class DetailsRequest(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=100)
+    details_ref: str = Field(min_length=1, max_length=800)
+
+
+@app.post("/details")
+def details(req: DetailsRequest) -> dict:
+    provider_id = (req.provider_id or "").strip()
+    details_ref = (req.details_ref or "").strip()
+    if not provider_id or not details_ref:
+        return JSONResponse(status_code=400, content={"detail": "Missing provider_id/details_ref"})
+
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT details_text FROM item_details WHERE provider_id=%s AND details_ref=%s",
+            (provider_id, details_ref),
+        ).fetchone()
+        if row and row.get("details_text"):
+            return {"text": row["details_text"]}
+
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
