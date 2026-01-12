@@ -212,6 +212,7 @@ class SearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=200)
     kinds: list[str] | None = None
     limit: int = Field(default=50, ge=1, le=200)
+    cursor: int | None = Field(default=None, ge=1)
 
 
 @app.post("/search")
@@ -222,6 +223,7 @@ def search(req: SearchRequest) -> list[dict]:
 
     sql = (
         "SELECT "
+        "  si.id AS item_id, "
         "  p.kind, "
         "  si.provider_id, "
         "  p.display_name AS provider_name, "
@@ -252,8 +254,14 @@ def search(req: SearchRequest) -> list[dict]:
         sql += " AND p.kind = ANY(%s)"
         params.append(req.kinds)
 
-    # Intentionally avoid ORDER BY here: with a large archive this would force a full scan+sort
-    # for common queries. Clients can sort the limited result set locally if needed.
+    # Cursor-based pagination: fetch older rows by id (newest first).
+    if req.cursor:
+        sql += " AND si.id < %s"
+        params.append(int(req.cursor))
+
+    # Deterministic ordering for paging.
+    sql += " ORDER BY si.id DESC"
+
     sql += " LIMIT %s"
     params.append(req.limit)
 
