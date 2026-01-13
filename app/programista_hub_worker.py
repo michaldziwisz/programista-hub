@@ -973,10 +973,21 @@ def _refresh_archive(conn) -> None:
     if previous_version_s != current_version_s:
         log.info("Fandom: parser version %s -> %s, scheduling re-ingest", previous_version_s, current_version_s)
         with conn.transaction():
-            conn.execute(
-                "UPDATE provider_page SET rev_id = NULL WHERE provider_id = %s",
-                (FANDOM_PROVIDER_ID,),
-            )
+            if ARCHIVE_PARSER_VERSION == 3:
+                # v3: logo-file based matching for day pages (e.g. 1999) where channel blocks are
+                # separated by logo images and category order is unreliable.
+                reingest_from = date(1999, 1, 1)
+                reingest_to = date(1999, 12, 31)
+                log.info("Fandom: marking pages for re-ingest: %s..%s", reingest_from, reingest_to)
+                conn.execute(
+                    "UPDATE provider_page SET rev_id = NULL WHERE provider_id = %s AND day BETWEEN %s AND %s",
+                    (FANDOM_PROVIDER_ID, reingest_from, reingest_to),
+                )
+            else:
+                conn.execute(
+                    "UPDATE provider_page SET rev_id = NULL WHERE provider_id = %s",
+                    (FANDOM_PROVIDER_ID,),
+                )
             conn.execute(
                 """
                 INSERT INTO fetch_state (key, updated_at, value)

@@ -17,7 +17,7 @@ import requests
 FANDOM_API = "https://staratelewizja.fandom.com/pl/api.php"
 FANDOM_PROVIDER_ID = "fandom-archive"
 FANDOM_DISPLAY_NAME = "Programy archiwalne (Fandom)"
-ARCHIVE_PARSER_VERSION = 2
+ARCHIVE_PARSER_VERSION = 3
 
 DEFAULT_SINGLE_CHANNEL_SOURCE_NAME = "TVP 1"
 
@@ -359,14 +359,22 @@ def extract_channels_from_category_links(wikitext: str) -> list[str]:
 
 
 def split_wikitext_file_blocks(wikitext: str) -> list[str]:
+    return [b for _file, b in split_wikitext_file_blocks_with_files(wikitext)]
+
+
+def split_wikitext_file_blocks_with_files(wikitext: str) -> list[tuple[str, str]]:
     if not wikitext:
         return []
 
-    file_start_re = re.compile(r"^\s*\[\[(?:Plik|File):[^\]]+\]\]\s*(?P<rest>.*)$", re.IGNORECASE)
+    file_start_re = re.compile(
+        r"^\s*\[\[(?:Plik|File):(?P<file>[^\]|]+)(?:\|[^\]]*)?\]\]\s*(?P<rest>.*)$",
+        re.IGNORECASE,
+    )
     time_hint_re = re.compile(r"\b\d{1,2}[:.]\d{2}\b")
 
-    blocks: list[str] = []
+    blocks: list[tuple[str, str]] = []
     current: list[str] = []
+    current_file: str | None = None
     started = False
 
     for line in wikitext.splitlines():
@@ -378,10 +386,11 @@ def split_wikitext_file_blocks(wikitext: str) -> list[str]:
         if m:
             if started:
                 block = "\n".join(current).strip()
-                if block and time_hint_re.search(block):
-                    blocks.append(block)
+                if current_file and block and time_hint_re.search(block):
+                    blocks.append((current_file, block))
             current = []
             started = True
+            current_file = _clean_text(m.group("file"))
             rest = m.group("rest").strip()
             if rest:
                 current.append(rest)
@@ -393,10 +402,218 @@ def split_wikitext_file_blocks(wikitext: str) -> list[str]:
 
     if started:
         block = "\n".join(current).strip()
-        if block and time_hint_re.search(block):
-            blocks.append(block)
+        if current_file and block and time_hint_re.search(block):
+            blocks.append((current_file, block))
 
     return blocks
+
+
+_LOGO_FILE_CHANNEL_KEY_MAP: dict[str, str] = {
+    # Some pages use generic file names for channel logos; these are stable on the wiki.
+    "logo4": "tvp2",
+    "logo19": "tvn",
+}
+
+
+def _fold_for_match(text: str) -> str:
+    folded = _fold(text)
+    return folded.replace("ł", "l")
+
+
+def _compact_word_key(text: str) -> str:
+    return re.sub(r"[\W_]+", "", _fold_for_match(text))
+
+
+def _normalize_logo_file_base(file_name: str) -> str:
+    base = (file_name or "").strip()
+    base = re.sub(r"\.(png|jpe?g|gif|svg|webp)$", "", base, flags=re.IGNORECASE)
+    base = re.sub(r"^\s*\d+px-", "", base, flags=re.IGNORECASE)
+    return base.replace("_", " ").strip()
+
+
+def _logo_file_base_variants(file_name: str) -> list[str]:
+    base = _normalize_logo_file_base(file_name)
+    if not base:
+        return []
+
+    variants: list[str] = [base]
+
+    no_parens = re.sub(r"\s*\([^)]*\)\s*", " ", base).strip()
+    if no_parens and no_parens != base:
+        variants.append(no_parens)
+
+    no_years = re.sub(r"\b\d{4}\b", " ", no_parens or base).strip()
+    if no_years and no_years != no_parens and no_years != base:
+        variants.append(no_years)
+
+    no_dash_num = re.sub(r"[-–]\s*\d{3,}$", "", no_years or no_parens or base).strip()
+    if no_dash_num and no_dash_num not in variants:
+        variants.append(no_dash_num)
+
+    return variants
+
+
+def _roman_to_int_token(token: str) -> str:
+    token_norm = (token or "").casefold()
+    return {
+        "i": "1",
+        "ii": "2",
+        "iii": "3",
+        "iv": "4",
+        "v": "5",
+        "vi": "6",
+        "vii": "7",
+        "viii": "8",
+        "ix": "9",
+        "x": "10",
+    }.get(token_norm, token)
+
+
+def _normalize_roman_numerals(text: str) -> str:
+    if not text:
+        return ""
+    tokens = re.split(r"(\W+)", text)
+    out: list[str] = []
+    for tok in tokens:
+        if tok and re.fullmatch(r"[IVXivx]+", tok):
+            out.append(_roman_to_int_token(tok))
+        else:
+            out.append(tok)
+    return "".join(out)
+
+
+def _looks_like_regional_channel(name: str) -> bool:
+    if not name:
+        return False
+    tokens = re.findall(r"[\wąćęłńóśżź]+", name.casefold())
+    if len(tokens) >= 3 and tokens[0] == "tv" and tokens[1].isdigit():
+        return True
+    if len(tokens) >= 2 and tokens[0] == "tvp" and not tokens[1].isdigit():
+        return True
+    return False
+
+
+def _extract_location_token(name: str) -> str | None:
+    if not name:
+        return None
+    tokens = re.findall(r"[\wąćęłńóśżź]+", name.casefold())
+    stop = {"tv", "tvp", "hd"}
+    for tok in reversed(tokens):
+        if tok in stop:
+            continue
+        if tok.isdigit():
+            continue
+        if len(tok) < 3:
+            continue
+        return _fold_for_match(tok)
+    return None
+
+
+def _channel_logo_match_score(channel_name: str, file_name: str) -> int:
+    channel_key = _channel_key(channel_name)
+    channel_compact = _compact_word_key(channel_key)
+    if not channel_compact:
+        return 0
+
+    file_variants = _logo_file_base_variants(file_name)
+    if not file_variants:
+        return 0
+
+    file_key_for_map = _compact_word_key(file_variants[0])
+    mapped = _LOGO_FILE_CHANNEL_KEY_MAP.get(file_key_for_map)
+    if mapped and mapped == channel_key:
+        return 100
+
+    if channel_key == "wot":
+        folded = _fold_for_match(file_variants[0])
+        if "oddzial telewizyjny" in folded:
+            return 100
+
+    if _looks_like_regional_channel(channel_name):
+        location = _extract_location_token(channel_name)
+        if location:
+            file_folded = _fold_for_match(file_variants[0])
+            if location and location in file_folded:
+                return 95
+
+    best = 0
+    for variant in file_variants:
+        variant_norm = _normalize_roman_numerals(variant)
+        file_compact = _compact_word_key(variant_norm)
+        if not file_compact:
+            continue
+
+        if file_compact == channel_compact:
+            best = max(best, 95)
+            continue
+
+        if channel_compact in file_compact:
+            score = 80
+            if file_compact.startswith(channel_compact):
+                next_char = file_compact[len(channel_compact) : len(channel_compact) + 1]
+                if next_char.isdigit() and not channel_compact[-1].isdigit():
+                    variant_folded = _fold_for_match(variant_norm)
+                    channel_folded = _fold_for_match(channel_name).strip()
+                    if variant_folded.startswith(channel_folded):
+                        sep = variant_folded[len(channel_folded) : len(channel_folded) + 1]
+                        if sep.isspace():
+                            score -= 10
+            best = max(best, score)
+            continue
+
+        if file_compact in channel_compact:
+            best = max(best, 70)
+            continue
+
+        m_ch = re.match(r"^(tvp?\d+)", channel_compact)
+        m_file = re.match(r"^(tvp?\d+)", file_compact)
+        if m_ch and m_file and m_ch.group(1) == m_file.group(1):
+            best = max(best, 75)
+
+    return best
+
+
+def _extract_channel_schedule_from_logo_files(wikitext: str, channel_name: str) -> str | None:
+    file_blocks = split_wikitext_file_blocks_with_files(wikitext)
+    if not file_blocks:
+        return None
+
+    if "/" in channel_name:
+        parts = [p.strip() for p in channel_name.split("/") if p.strip()]
+        matched: list[str] = []
+        for part in parts:
+            best_score = 0
+            best_block: str | None = None
+            for file_name, block in file_blocks:
+                score = _channel_logo_match_score(part, file_name)
+                if score > best_score:
+                    best_score = score
+                    best_block = block
+            if best_block and best_score >= 70:
+                matched.append(best_block)
+
+        if matched:
+            seen_blocks: set[str] = set()
+            merged: list[str] = []
+            for _file_name, block in file_blocks:
+                if block in seen_blocks:
+                    continue
+                if block in matched:
+                    seen_blocks.add(block)
+                    merged.append(block)
+            return "\n".join(merged).strip() or None
+
+    best_score = 0
+    best_block = None
+    for file_name, block in file_blocks:
+        score = _channel_logo_match_score(channel_name, file_name)
+        if score > best_score:
+            best_score = score
+            best_block = block
+
+    if best_block and best_score >= 70:
+        return best_block
+    return None
 
 
 def split_wikitext_plain_channel_sections(wikitext: str) -> list[tuple[str, str]]:
@@ -512,6 +729,10 @@ def extract_channel_schedule_from_wikitext(wikitext: str, channel_name: str) -> 
     block = "\n".join(collected).strip()
     if block:
         return block
+
+    file_block = _extract_channel_schedule_from_logo_files(wikitext, channel_name)
+    if file_block:
+        return file_block
 
     channels = extract_channels_from_category_links(wikitext)
     blocks = split_wikitext_file_blocks(wikitext)
