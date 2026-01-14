@@ -307,34 +307,52 @@ def search(req: SearchRequest) -> list[dict]:
         remaining = int(req.limit) - len(rows_fast)
 
         if not include_details:
-            # Slow path (older ids): trigram indexes on title/subtitle.
+            # Slow path (older ids): materialize trigram matches, then order by id.
             sql_slow = (
-                "SELECT "
-                "  si.id AS item_id, "
-                "  p.kind, "
-                "  si.provider_id, "
-                "  p.display_name AS provider_name, "
-                "  si.source_id, "
-                "  s.name AS source_name, "
-                "  si.day, "
-                "  si.start_time, "
-                "  si.title, "
-                "  si.subtitle, "
-                "  si.details_ref, "
-                "  si.details_summary, "
-                "  COALESCE(si.accessibility, '[]'::jsonb) AS accessibility "
-                "FROM schedule_item si "
-                "JOIN provider p ON p.id = si.provider_id "
-                "JOIN source s ON s.provider_id = si.provider_id AND s.id = si.source_id "
-                "WHERE si.id < %s "
-                "  AND (programista_unaccent(lower(si.title)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\' "
-                "       OR (si.subtitle IS NOT NULL AND programista_unaccent(lower(si.subtitle)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\'))"
+                "WITH matches AS MATERIALIZED ("
+                "  SELECT "
+                "    si.id AS item_id, "
+                "    p.kind, "
+                "    si.provider_id, "
+                "    p.display_name AS provider_name, "
+                "    si.source_id, "
+                "    si.day, "
+                "    si.start_time, "
+                "    si.title, "
+                "    si.subtitle, "
+                "    si.details_ref, "
+                "    si.details_summary, "
+                "    COALESCE(si.accessibility, '[]'::jsonb) AS accessibility "
+                "  FROM schedule_item si "
+                "  JOIN provider p ON p.id = si.provider_id "
+                "  WHERE si.id < %s "
+                "    AND (programista_unaccent(lower(si.title)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\' "
+                "         OR (si.subtitle IS NOT NULL AND programista_unaccent(lower(si.subtitle)) LIKE programista_unaccent(lower(%s)) ESCAPE '\\'))"
             )
             params_slow: list[object] = [recent_low, pattern, pattern]
             if kinds:
                 sql_slow += " AND p.kind = ANY(%s)"
                 params_slow.append(kinds)
-            sql_slow += " ORDER BY si.id DESC LIMIT %s"
+            sql_slow += (
+                ") "
+                "SELECT "
+                "  m.item_id, "
+                "  m.kind, "
+                "  m.provider_id, "
+                "  m.provider_name, "
+                "  m.source_id, "
+                "  s.name AS source_name, "
+                "  m.day, "
+                "  m.start_time, "
+                "  m.title, "
+                "  m.subtitle, "
+                "  m.details_ref, "
+                "  m.details_summary, "
+                "  m.accessibility "
+                "FROM matches m "
+                "JOIN source s ON s.provider_id = m.provider_id AND s.id = m.source_id "
+                "ORDER BY m.item_id DESC LIMIT %s"
+            )
             params_slow.append(remaining)
             rows_slow = conn.execute(sql_slow, params_slow).fetchall()
             return list(rows_fast) + list(rows_slow)
